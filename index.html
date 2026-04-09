@@ -1,0 +1,1265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>粒子星球手势控制器</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        /* 用于MediaPipe输入的视频，隐藏 */
+        #input-video {
+            display: none;
+        }
+
+        /* UI 提示层 */
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            color: rgba(255, 255, 255, 0.8);
+            pointer-events: none;
+            user-select: none;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px rgba(255, 166, 0, 0.8);
+        }
+
+        .instruction {
+            margin-top: 10px;
+            font-size: 0.9rem;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            border-left: 3px solid #ffaa00;
+        }
+
+        .status {
+            margin-top: 5px;
+            font-weight: bold;
+            color: #00ffcc;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            z-index: 20;
+            text-align: center;
+        }
+        
+        /* 摄像头预览小窗 */
+        #webcam-preview {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 160px;
+            height: 120px;
+            z-index: 10;
+            border: 2px solid #333;
+            border-radius: 8px;
+            opacity: 0.7;
+            transform: scaleX(-1); /* 镜像翻转 */
+        }
+    </style>
+
+    <!-- 1. MediaPipe 依赖 (常规 Script 方式) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <!-- 2. Three.js Import Map for Modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="loading">正在启动神经连接...<br><span style="font-size:14px; opacity:0.7">请允许摄像头权限</span></div>
+
+    <div id="ui-layer">
+        <h1>粒子星云核心</h1>
+        <div class="instruction">
+            👋 <b>旋转手掌</b>: 旋转相机视角<br>
+            ✊ <b>握拳并拉远</b>: 相机远离 (加速)<br>
+            ✋ <b>五指张开靠近</b>: 相机靠近 (减速)<br>
+        </div>
+        <div class="instruction" style="margin-top: 10px; border-left-color: #44ff44;">
+            🎵 <b>按任意键或点击屏幕</b>: 启动背景音乐
+        </div>
+        <div id="gesture-status" class="status">等待手势...</div>
+    </div>
+
+    <!-- 隐藏的原始视频输入 -->
+    <video id="input-video"></video>
+    <!-- 用于反馈的小画布 -->
+    <canvas id="webcam-preview"></canvas>
+    <!-- 主3D场景 -->
+    <div id="canvas-container"></div>
+    
+    <!-- 背景音乐 -->
+    <audio id="background-music" loop preload="auto">
+        <source src="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3" type="audio/mpeg">
+        Your browser does not support the audio element.
+    </audio>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // ==========================================        // 1. 全局变量与配置        // ==========================================
+        /**
+         * 全局配置对象
+         * @typedef {Object} ParticleConfig
+         * @property {number} coreColor - 粒子核心颜色（十六进制颜色值，如 0xffffff）
+         * @property {number} nebulaColor - 星云气体颜色（十六进制颜色值，如 0x00ffff）
+         * @property {number} particleCount - 粒子核心的粒子数量（建议范围：1000-50000）
+         * @property {number} trailParticleCount - 轨迹系统的粒子数量（建议范围：1000-50000）
+         * @property {number} minDistance - 相机最小观察距离（必须小于 maxDistance）
+         * @property {number} maxDistance - 相机最大观察距离（必须大于 minDistance）
+         * @property {number} defaultDistance - 相机默认距离（必须在 minDistance 和 maxDistance 之间）
+         * @property {number} rotationSpeedMultiplier - 旋转速度乘数（建议范围：0.01-0.1）
+         * @property {number} particleSpeed - 粒子移动速度（建议范围：0.5-5）
+         * @property {number} particleSize - 粒子核心大小（必须大于 0）
+         * @property {number} nebulaSize - 星云大小（必须大于 particleSize）
+         */
+
+        /** @type {ParticleConfig} */
+        const CONFIG = {
+            // 粒子核心颜色 - 炽热白色，用于中心高亮区域
+            coreColor: 0xffffff,
+            
+            // 星云气体颜色 - 青蓝色，用于外围光晕效果
+            nebulaColor: 0x00ffff,
+            
+            // 粒子数量 - 核心区域的粒子总数，影响核心的密度和细节
+            particleCount: 8000,
+            
+            // 轨迹粒子数量 - 尾迹效果的粒子总数，影响轨迹的平滑度
+            trailParticleCount: 5000,
+            
+            // 最小距离 - 相机能靠近粒子的最小距离，防止穿模
+            minDistance: 120,
+            
+            // 最大距离 - 相机能远离粒子的最大距离，保证粒子可见
+            maxDistance: 800,
+            
+            // 默认距离 - 初始相机距离，提供最佳的观察视角
+            defaultDistance: 300,
+            
+            // 旋转速度乘数 - 控制手势旋转的灵敏度，值越大旋转越快
+            rotationSpeedMultiplier: 0.05,
+            
+            // 粒子移动速度 - 粒子在空间中移动的基础速度
+            particleSpeed: 2,
+            
+            // 粒子大小 - 核心粒子的基础大小，影响核心的视觉体积
+            particleSize: 10,
+            
+            // 星云大小 - 外围星云的扩展范围，应该大于 particleSize
+            nebulaSize: 20
+        };
+
+        /**
+         * 验证配置对象的完整性和合理性
+         * @throws {Error} 当配置缺失或值不合理时抛出错误
+         */
+        function validateConfig() {
+            const requiredConfigs = [
+                'coreColor', 'nebulaColor', 'particleCount', 'trailParticleCount',
+                'minDistance', 'maxDistance', 'defaultDistance', 'rotationSpeedMultiplier',
+                'particleSpeed', 'particleSize', 'nebulaSize'
+            ];
+            
+            // 检查必需的配置项是否存在
+            for (const key of requiredConfigs) {
+                if (CONFIG[key] === undefined) {
+                    throw new Error(`配置项缺失: CONFIG.${key} 未定义`);
+                }
+            }
+            
+            // 验证数值范围
+            if (CONFIG.particleCount <= 0 || CONFIG.particleCount > 50000) {
+                throw new Error(`particleCount 必须在 1-50000 范围内，当前值: ${CONFIG.particleCount}`);
+            }
+            
+            if (CONFIG.trailParticleCount <= 0 || CONFIG.trailParticleCount > 50000) {
+                throw new Error(`trailParticleCount 必须在 1-50000 范围内，当前值: ${CONFIG.trailParticleCount}`);
+            }
+            
+            if (CONFIG.minDistance >= CONFIG.maxDistance) {
+                throw new Error(`minDistance (${CONFIG.minDistance}) 必须小于 maxDistance (${CONFIG.maxDistance})`);
+            }
+            
+            if (CONFIG.defaultDistance < CONFIG.minDistance || CONFIG.defaultDistance > CONFIG.maxDistance) {
+                throw new Error(`defaultDistance (${CONFIG.defaultDistance}) 必须在 minDistance 和 maxDistance 之间`);
+            }
+            
+            if (CONFIG.particleSize <= 0) {
+                throw new Error(`particleSize 必须大于 0，当前值: ${CONFIG.particleSize}`);
+            }
+            
+            if (CONFIG.nebulaSize <= CONFIG.particleSize) {
+                throw new Error(`nebulaSize (${CONFIG.nebulaSize}) 必须大于 particleSize (${CONFIG.particleSize})`);
+            }
+            
+            console.log('✓ 配置验证通过');
+        }
+
+        // 在初始化时验证配置
+        validateConfig();
+
+        /**
+         * 配置管理器类
+         * 提供统一的配置访问、验证和修改接口
+         */
+        class ConfigManager {
+            constructor(config) {
+                this.config = config;
+                this.listeners = [];
+                this.validate();
+            }
+            
+            /**
+             * 验证配置
+             * @throws {Error} 当配置无效时抛出错误
+             */
+            validate() {
+                // 复用之前的验证逻辑
+                const requiredConfigs = [
+                    'coreColor', 'nebulaColor', 'particleCount', 'trailParticleCount',
+                    'minDistance', 'maxDistance', 'defaultDistance', 'rotationSpeedMultiplier',
+                    'particleSpeed', 'particleSize', 'nebulaSize'
+                ];
+                
+                for (const key of requiredConfigs) {
+                    if (this.config[key] === undefined) {
+                        throw new Error(`配置项缺失: ${key} 未定义`);
+                    }
+                }
+                
+                // 验证数值范围
+                if (this.config.minDistance >= this.config.maxDistance) {
+                    throw new Error(`minDistance 必须小于 maxDistance`);
+                }
+                
+                if (this.config.defaultDistance < this.config.minDistance || 
+                    this.config.defaultDistance > this.config.maxDistance) {
+                    throw new Error(`defaultDistance 必须在 minDistance 和 maxDistance 之间`);
+                }
+            }
+            
+            /**
+             * 获取配置值
+             * @param {string} key - 配置项名称
+             * @returns {*} 配置值
+             */
+            get(key) {
+                if (this.config[key] === undefined) {
+                    console.warn(`配置项 ${key} 不存在`);
+                    return undefined;
+                }
+                return this.config[key];
+            }
+            
+            /**
+             * 设置配置值
+             * @param {string} key - 配置项名称
+             * @param {*} value - 新的配置值
+             */
+            set(key, value) {
+                const oldValue = this.config[key];
+                this.config[key] = value;
+                
+                try {
+                    this.validate();
+                    this.notifyListeners(key, oldValue, value);
+                } catch (error) {
+                    this.config[key] = oldValue; // 回滚
+                    throw error;
+                }
+            }
+            
+            /**
+             * 添加配置变更监听器
+             * @param {Function} listener - 监听器函数
+             */
+            addListener(listener) {
+                this.listeners.push(listener);
+            }
+            
+            /**
+             * 通知监听器配置已变更
+             */
+            notifyListeners(key, oldValue, newValue) {
+                this.listeners.forEach(listener => {
+                    try {
+                        listener(key, oldValue, newValue);
+                    } catch (error) {
+                        console.error('配置监听器执行出错:', error);
+                    }
+                });
+            }
+            
+            /**
+             * 获取所有配置
+             * @returns {Object} 配置对象的副本
+             */
+            getAll() {
+                return { ...this.config };
+            }
+        }
+
+        // 创建配置管理器实例
+        const configManager = new ConfigManager(CONFIG);
+
+        let scene, camera, renderer, composer;
+        let particleSystem, trailSystem, nebulaSystem, fingerSystem, faceSystem, coronaSystem, rippleSystem, haloSystem;
+        let time = 0;
+
+        // 相机控制状态
+        const cameraState = {
+            radius: CONFIG.defaultDistance,
+            theta: Math.PI / 2, // 垂直角度
+            phi: 0,             // 水平角度
+            zoomVelocity: 0,    // 缩放速度
+            targetRadius: CONFIG.defaultDistance,
+            isFist: false,
+            isOpen: false,
+            handRotation: 0     // 手掌旋转量
+        };
+
+        // 粒子状态
+        const particleState = {
+            position: new THREE.Vector3(-200, 0, 0),
+            velocity: new THREE.Vector3(CONFIG.particleSpeed, 0, 0),
+            size: CONFIG.particleSize,
+            trail: []
+        };
+
+        const statusEl = document.getElementById('gesture-status');
+        const loadingEl = document.getElementById('loading');
+
+        // ==========================================
+        // 2. Three.js 初始化与场景构建
+        // ==========================================
+        
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+
+            // 场景
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.0005);
+
+            // 相机
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 2000);
+            camera.position.set(0, 0, CONFIG.defaultDistance);
+
+            // 添加左上角单侧强冷光源
+            const coldLight = new THREE.DirectionalLight(0x00ffff, 1.5);
+            coldLight.position.set(-100, 100, 50); // 左上角位置
+            scene.add(coldLight);
+
+            // 添加环境光
+            const ambientLight = new THREE.AmbientLight(0x111111, 0.3);
+            scene.add(ambientLight);
+
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            // 后期处理 (Bloom 发光)
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.2, 0.5, 0.7);
+            bloomPass.threshold = 0.1;
+            bloomPass.strength = 1.5; // 适中强度，更符合电影级效果
+            bloomPass.radius = 0.6;
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            // 增强渲染质量
+            renderer.toneMapping = THREE.ReinhardToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            // 使用新的API：outputColorSpace替代outputEncoding
+            if (renderer.outputColorSpace !== undefined) {
+                renderer.outputColorSpace = THREE.SRGBColorSpace;
+            } else {
+                // 兼容旧版本
+                renderer.outputEncoding = THREE.sRGBEncoding;
+            }
+
+            // 创建材质纹理 (光点)
+            const particleTexture = createParticleTexture();
+
+            // --- 创建粒子核心（炽热白色热核） ---
+            const particleGeo = new THREE.BufferGeometry();
+            const particlePos = [];
+            const particleSizes = [];
+            const particleColors = [];
+
+            // 生成粒子核心（炽热白色等离子体）
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                // 极坐标随机分布，主要在核心区域
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                
+                // 半径分布：主要在核心表面，少量在内部
+                let r = CONFIG.particleSize * 0.8;
+                if (Math.random() > 0.7) r = CONFIG.particleSize * 0.8 * Math.random();
+
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                particlePos.push(x, y, z);
+                particleSizes.push(Math.random() * 2 + 1);
+                
+                // 核心颜色：亮白色
+                const intensity = 1 - r / (CONFIG.particleSize * 0.8);
+                particleColors.push(1, 1, 1); // 纯白色
+            }
+
+            particleGeo.setAttribute('position', new THREE.Float32BufferAttribute(particlePos, 3));
+            particleGeo.setAttribute('size', new THREE.Float32BufferAttribute(particleSizes, 1));
+            particleGeo.setAttribute('color', new THREE.Float32BufferAttribute(particleColors, 3));
+
+            const particleMat = new THREE.PointsMaterial({
+                size: 3,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.9,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true,
+                sizeAttenuation: true
+            });
+
+            particleSystem = new THREE.Points(particleGeo, particleMat);
+            particleSystem.position.copy(particleState.position);
+            scene.add(particleSystem);
+
+            // --- 创建淡蓝色晕轮 ---
+            const haloGeo = new THREE.BufferGeometry();
+            const haloPos = [];
+            const haloSizes = [];
+            const haloColors = [];
+
+            // 生成淡蓝色晕轮
+            for (let i = 0; i < CONFIG.particleCount * 0.3; i++) {
+                // 极坐标随机分布
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                
+                // 半径分布：从核心边缘到晕轮边缘
+                let r = THREE.MathUtils.lerp(CONFIG.particleSize, CONFIG.particleSize * 1.5, Math.random());
+
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                haloPos.push(x, y, z);
+                haloSizes.push(Math.random() * 2 + 1);
+                
+                // 颜色：淡蓝色
+                const color = new THREE.Color(0x00aaff);
+                const intensity = 1 - (r - CONFIG.particleSize) / (CONFIG.particleSize * 0.5);
+                color.setRGB(color.r * intensity, color.g * intensity, color.b * intensity);
+                haloColors.push(color.r, color.g, color.b);
+            }
+
+            haloGeo.setAttribute('position', new THREE.Float32BufferAttribute(haloPos, 3));
+            haloGeo.setAttribute('size', new THREE.Float32BufferAttribute(haloSizes, 1));
+            haloGeo.setAttribute('color', new THREE.Float32BufferAttribute(haloColors, 3));
+
+            const haloMat = new THREE.PointsMaterial({
+                size: 3,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.4,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            haloSystem = new THREE.Points(haloGeo, haloMat);
+            scene.add(haloSystem);
+
+            // --- 创建青紫色稀薄气体 ---
+            const nebulaGeo = new THREE.BufferGeometry();
+            const nebulaPos = [];
+            const nebulaSizes = [];
+            const nebulaColors = [];
+
+            // 生成青紫色稀薄气体
+            for (let i = 0; i < CONFIG.particleCount * 0.5; i++) {
+                // 极坐标随机分布，在更大的范围内
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                
+                // 半径分布：从晕轮边缘到星云边缘
+                let r = THREE.MathUtils.lerp(CONFIG.particleSize * 1.5, CONFIG.nebulaSize, Math.random());
+
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                nebulaPos.push(x, y, z);
+                nebulaSizes.push(Math.random() * 3 + 1);
+                
+                // 颜色：青紫色
+                const color = new THREE.Color(0x8800ff);
+                const intensity = 1 - (r - CONFIG.particleSize * 1.5) / (CONFIG.nebulaSize - CONFIG.particleSize * 1.5);
+                color.setRGB(color.r * intensity, color.g * intensity, color.b * intensity);
+                nebulaColors.push(color.r, color.g, color.b);
+            }
+
+            nebulaGeo.setAttribute('position', new THREE.Float32BufferAttribute(nebulaPos, 3));
+            nebulaGeo.setAttribute('size', new THREE.Float32BufferAttribute(nebulaSizes, 1));
+            nebulaGeo.setAttribute('color', new THREE.Float32BufferAttribute(nebulaColors, 3));
+
+            const nebulaMat = new THREE.PointsMaterial({
+                size: 3,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.3,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            nebulaSystem = new THREE.Points(nebulaGeo, nebulaMat);
+            nebulaSystem.position.copy(particleState.position);
+            scene.add(nebulaSystem);
+
+            // --- 创建轨迹系统 ---
+            const trailGeo = new THREE.BufferGeometry();
+            const trailPos = [];
+            const trailSizes = [];
+            const trailColors = [];
+
+            // 生成轨迹粒子
+            for (let i = 0; i < CONFIG.trailParticleCount; i++) {
+                trailPos.push(0, 0, 0);
+                trailSizes.push(Math.random() * 1.5 + 0.5);
+                
+                // 轨迹颜色：从青蓝色到透明
+                const color = new THREE.Color(CONFIG.nebulaColor);
+                const intensity = Math.random();
+                color.setRGB(color.r * intensity, color.g * intensity, color.b * intensity);
+                trailColors.push(color.r, color.g, color.b);
+            }
+
+            trailGeo.setAttribute('position', new THREE.Float32BufferAttribute(trailPos, 3));
+            trailGeo.setAttribute('size', new THREE.Float32BufferAttribute(trailSizes, 1));
+            trailGeo.setAttribute('color', new THREE.Float32BufferAttribute(trailColors, 3));
+
+            const trailMat = new THREE.PointsMaterial({
+                size: 2,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.4,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            trailSystem = new THREE.Points(trailGeo, trailMat);
+            scene.add(trailSystem);
+
+            // --- 创建手指虚影 ---
+            const fingerGeo = new THREE.BufferGeometry();
+            const fingerPos = [];
+            const fingerSizes = [];
+            const fingerColors = [];
+
+            // 手指形状的粒子分布
+            const fingerPoints = [
+                new THREE.Vector3(150, -100, 0),    // 手指根部
+                new THREE.Vector3(180, -120, 0),    // 第一指节
+                new THREE.Vector3(200, -140, 0),    // 第二指节
+                new THREE.Vector3(210, -160, 0),    // 指尖
+                new THREE.Vector3(190, -130, -10),  // 手指侧面
+                new THREE.Vector3(170, -110, -10),  // 手指侧面
+                new THREE.Vector3(160, -100, -10),  // 手指侧面
+                new THREE.Vector3(190, -130, 10),   // 手指侧面
+                new THREE.Vector3(170, -110, 10),   // 手指侧面
+                new THREE.Vector3(160, -100, 10)    // 手指侧面
+            ];
+
+            // 围绕手指形状生成粒子
+            for (let i = 0; i < 1000; i++) {
+                // 选择一个手指点
+                const basePoint = fingerPoints[Math.floor(Math.random() * fingerPoints.length)];
+                // 添加随机偏移
+                const offsetX = (Math.random() - 0.5) * 10;
+                const offsetY = (Math.random() - 0.5) * 5;
+                const offsetZ = (Math.random() - 0.5) * 5;
+                
+                fingerPos.push(basePoint.x + offsetX, basePoint.y + offsetY, basePoint.z + offsetZ);
+                fingerSizes.push(Math.random() * 2 + 1);
+                
+                // 半透明白色
+                const intensity = Math.random() * 0.5 + 0.1;
+                fingerColors.push(intensity, intensity, intensity);
+            }
+
+            fingerGeo.setAttribute('position', new THREE.Float32BufferAttribute(fingerPos, 3));
+            fingerGeo.setAttribute('size', new THREE.Float32BufferAttribute(fingerSizes, 1));
+            fingerGeo.setAttribute('color', new THREE.Float32BufferAttribute(fingerColors, 3));
+
+            const fingerMat = new THREE.PointsMaterial({
+                size: 2,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.3,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            fingerSystem = new THREE.Points(fingerGeo, fingerMat);
+            scene.add(fingerSystem);
+
+            // --- 创建拟人表情粒子 ---
+            const faceGeo = new THREE.BufferGeometry();
+            const facePos = [];
+            const faceSizes = [];
+            const faceColors = [];
+
+            // 生成^_^颜文字表情
+            const facePoints = [];
+            
+            // 左眼
+            for (let i = 0; i < 100; i++) {
+                const angle = (Math.random() * Math.PI) - Math.PI/2;
+                const radius = Math.random() * 3 + 2;
+                const x = -5 + radius * Math.cos(angle);
+                const y = 3 + radius * Math.sin(angle);
+                facePoints.push(new THREE.Vector3(x, y, 0));
+            }
+            
+            // 右眼
+            for (let i = 0; i < 100; i++) {
+                const angle = (Math.random() * Math.PI) - Math.PI/2;
+                const radius = Math.random() * 3 + 2;
+                const x = 5 + radius * Math.cos(angle);
+                const y = 3 + radius * Math.sin(angle);
+                facePoints.push(new THREE.Vector3(x, y, 0));
+            }
+            
+            // 嘴巴 (^ 形状)
+            for (let i = 0; i < 150; i++) {
+                const t = Math.random();
+                let x, y;
+                if (t < 0.5) {
+                    // 左半部分
+                    x = THREE.MathUtils.lerp(-8, 0, t * 2);
+                    y = THREE.MathUtils.lerp(-2, 3, t * 2);
+                } else {
+                    // 右半部分
+                    x = THREE.MathUtils.lerp(0, 8, (t - 0.5) * 2);
+                    y = THREE.MathUtils.lerp(3, -2, (t - 0.5) * 2);
+                }
+                // 添加一些随机偏移
+                x += (Math.random() - 0.5) * 1;
+                y += (Math.random() - 0.5) * 1;
+                facePoints.push(new THREE.Vector3(x, y, 0));
+            }
+
+            // 生成表情粒子
+            for (let i = 0; i < facePoints.length; i++) {
+                const point = facePoints[i];
+                facePos.push(point.x, point.y, point.z);
+                faceSizes.push(Math.random() * 2 + 1);
+                
+                // 暖黄色自发光
+                const color = new THREE.Color(0xffff88);
+                const intensity = Math.random() * 0.5 + 0.5;
+                color.setRGB(color.r * intensity, color.g * intensity, color.b * intensity);
+                faceColors.push(color.r, color.g, color.b);
+            }
+
+            faceGeo.setAttribute('position', new THREE.Float32BufferAttribute(facePos, 3));
+            faceGeo.setAttribute('size', new THREE.Float32BufferAttribute(faceSizes, 1));
+            faceGeo.setAttribute('color', new THREE.Float32BufferAttribute(faceColors, 3));
+
+            const faceMat = new THREE.PointsMaterial({
+                size: 2,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.9,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            faceSystem = new THREE.Points(faceGeo, faceMat);
+            scene.add(faceSystem);
+
+            // --- 创建日冕一样的柔和光流 ---
+            const coronaGeo = new THREE.BufferGeometry();
+            const coronaPos = [];
+            const coronaSizes = [];
+            const coronaColors = [];
+
+            // 生成日冕光流
+            for (let i = 0; i < 2000; i++) {
+                // 极坐标分布
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                
+                // 距离分布：从粒子边缘到日冕边缘
+                let r = THREE.MathUtils.lerp(CONFIG.nebulaSize, CONFIG.nebulaSize * 2, Math.random());
+
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                coronaPos.push(x, y, z);
+                coronaSizes.push(Math.random() * 3 + 1);
+                
+                // 颜色：从青蓝色到白色的渐变
+                const color = new THREE.Color(CONFIG.nebulaColor);
+                const intensity = 1 - (r - CONFIG.nebulaSize) / (CONFIG.nebulaSize);
+                color.setRGB(color.r * intensity + (1 - intensity), color.g * intensity + (1 - intensity), color.b * intensity + (1 - intensity));
+                coronaColors.push(color.r, color.g, color.b);
+            }
+
+            coronaGeo.setAttribute('position', new THREE.Float32BufferAttribute(coronaPos, 3));
+            coronaGeo.setAttribute('size', new THREE.Float32BufferAttribute(coronaSizes, 1));
+            coronaGeo.setAttribute('color', new THREE.Float32BufferAttribute(coronaColors, 3));
+
+            const coronaMat = new THREE.PointsMaterial({
+                size: 2,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.3,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            coronaSystem = new THREE.Points(coronaGeo, coronaMat);
+            scene.add(coronaSystem);
+
+            // --- 创建能量涟漪效果 ---
+            const rippleGeo = new THREE.BufferGeometry();
+            const ripplePos = [];
+            const rippleSizes = [];
+            const rippleColors = [];
+
+            // 生成涟漪粒子
+            for (let i = 0; i < 500; i++) {
+                const angle = Math.random() * 2 * Math.PI;
+                const radius = Math.random() * 10;
+                const x = radius * Math.cos(angle);
+                const y = radius * Math.sin(angle);
+                const z = (Math.random() - 0.5) * 5;
+
+                ripplePos.push(x, y, z);
+                rippleSizes.push(Math.random() * 2 + 1);
+                
+                // 白色能量涟漪
+                const intensity = Math.random() * 0.8 + 0.2;
+                rippleColors.push(intensity, intensity, intensity);
+            }
+
+            rippleGeo.setAttribute('position', new THREE.Float32BufferAttribute(ripplePos, 3));
+            rippleGeo.setAttribute('size', new THREE.Float32BufferAttribute(rippleSizes, 1));
+            rippleGeo.setAttribute('color', new THREE.Float32BufferAttribute(rippleColors, 3));
+
+            const rippleMat = new THREE.PointsMaterial({
+                size: 2,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.6,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                vertexColors: true
+            });
+
+            rippleSystem = new THREE.Points(rippleGeo, rippleMat);
+            scene.add(rippleSystem);
+
+            // 监听窗口调整
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // 辅助函数：生成圆形渐变Canvas纹理
+        function createParticleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const context = canvas.getContext('2d');
+            
+            // 创建更柔和的径向渐变
+            const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 32);
+            gradient.addColorStop(0, 'rgba(255,255,255,1)');
+            gradient.addColorStop(0.1, 'rgba(255,255,255,0.9)');
+            gradient.addColorStop(0.3, 'rgba(255,255,255,0.6)');
+            gradient.addColorStop(0.6, 'rgba(255,255,255,0.3)');
+            gradient.addColorStop(0.8, 'rgba(255,255,255,0.1)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            
+            context.fillStyle = gradient;
+            context.fillRect(0, 0, 64, 64);
+            
+            // 添加轻微的噪点效果，增强真实感
+            for (let i = 0; i < 50; i++) {
+                const x = Math.random() * 64;
+                const y = Math.random() * 64;
+                const size = Math.random() * 2 + 1;
+                const alpha = Math.random() * 0.3 + 0.1;
+                context.fillStyle = `rgba(255,255,255,${alpha})`;
+                context.beginPath();
+                context.arc(x, y, size, 0, Math.PI * 2);
+                context.fill();
+            }
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // ==========================================
+        // 3. 动画与逻辑更新
+        // ==========================================
+
+        function updateCamera() {
+            // 1. 处理旋转 (根据手势)
+            // 手掌旋转值 (cameraState.handRotation) 是一个偏移量
+            // 如果手旋转了，我们让相机围绕中心旋转（改变 phi）
+            // 设置一个死区，防止抖动
+            if (Math.abs(cameraState.handRotation) > 0.1) {
+                cameraState.phi += cameraState.handRotation * CONFIG.rotationSpeedMultiplier;
+            }
+
+            // 2. 处理缩放 (握拳 vs 张开)
+            if (cameraState.isFist) {
+                // 握拳: 远离。速度先慢后快。
+                // 增加向外的速度
+                cameraState.zoomVelocity += 0.5; 
+            } else if (cameraState.isOpen) {
+                // 张开: 靠近。速度先快后慢。
+                // 我们通过设置目标点来实现"先快后慢"的 lerp 效果
+                // 为了模拟"靠近"，我们将目标设为 minDistance
+                cameraState.targetRadius = CONFIG.minDistance;
+                
+                // 使用 Lerp 逼近，越近越慢
+                const diff = cameraState.radius - CONFIG.minDistance;
+                cameraState.zoomVelocity = -diff * 0.05; // 距离越远速度越快，越近越慢
+            } else {
+                // 无手势，阻尼停止
+                cameraState.zoomVelocity *= 0.9;
+            }
+
+            // 应用速度
+            cameraState.radius += cameraState.zoomVelocity;
+
+            // 限制范围
+            if (cameraState.radius < CONFIG.minDistance) {
+                cameraState.radius = CONFIG.minDistance;
+                cameraState.zoomVelocity = 0;
+            }
+            if (cameraState.radius > 2000) {
+                 cameraState.radius = 2000; // 防止无限远
+            }
+
+            // 3. 将球坐标转换为笛卡尔坐标
+            // x = r * sin(theta) * sin(phi)
+            // y = r * cos(theta)
+            // z = r * sin(theta) * cos(phi)
+            // 注意：为了让星球像在旋转，我们改变 phi (水平环绕)
+            
+            // 添加一点自然的星球自转感(如果没动手)
+            if (!cameraState.isFist && !cameraState.isOpen && Math.abs(cameraState.handRotation) < 0.1) {
+               cameraState.phi -= 0.001;
+            }
+
+            // 电影级视角：稍微从上方俯视，增强立体感
+            cameraState.theta = Math.PI / 2.2; // 稍微向下看
+
+            camera.position.x = cameraState.radius * Math.sin(cameraState.theta) * Math.sin(cameraState.phi);
+            camera.position.y = cameraState.radius * Math.cos(cameraState.theta); // 稍微从上方俯视
+            camera.position.z = cameraState.radius * Math.sin(cameraState.theta) * Math.cos(cameraState.phi);
+
+            // 相机看向粒子前方一点，增强运动感
+            const lookAhead = particleState.position.clone().add(particleState.velocity.clone().multiplyScalar(5));
+            camera.lookAt(lookAhead);
+        }
+
+        function updateParticle() {
+            // 更新粒子位置
+            particleState.position.add(particleState.velocity);
+
+            // 边界检测，让粒子循环移动
+            if (particleState.position.x > 200) {
+                particleState.position.x = -200;
+            }
+
+            // 更新粒子系统位置
+            if (particleSystem) {
+                particleSystem.position.copy(particleState.position);
+                // 彗星状椭圆形态：根据速度方向拉伸
+                const speed = particleState.velocity.length();
+                const direction = particleState.velocity.clone().normalize();
+                particleSystem.scale.set(1, 1, 1 + speed * 0.1);
+                particleSystem.lookAt(particleState.position.clone().add(particleState.velocity));
+            }
+
+            // 更新星云系统位置
+            if (nebulaSystem) {
+                nebulaSystem.position.copy(particleState.position);
+                // 星云也随速度方向拉伸
+                const speed = particleState.velocity.length();
+                nebulaSystem.scale.set(1, 1, 1 + speed * 0.15);
+                nebulaSystem.lookAt(particleState.position.clone().add(particleState.velocity));
+            }
+
+            // 更新晕轮系统位置
+            if (haloSystem) {
+                haloSystem.position.copy(particleState.position);
+                // 晕轮随速度方向拉伸
+                const speed = particleState.velocity.length();
+                haloSystem.scale.set(1, 1, 1 + speed * 0.1);
+                haloSystem.lookAt(particleState.position.clone().add(particleState.velocity));
+            }
+
+            // 更新手指虚影位置，使其始终在粒子尾部附近
+            if (typeof fingerSystem !== 'undefined') {
+                // 计算粒子尾部位置
+                const direction = particleState.velocity.clone().normalize().negate();
+                const tailPosition = particleState.position.clone().add(direction.multiplyScalar(30));
+                
+                // 手指虚影位置：右下角，指尖轻触粒子尾部
+                fingerSystem.position.set(
+                    tailPosition.x + 150,  // 右侧偏移
+                    tailPosition.y - 100,  // 下方偏移
+                    tailPosition.z
+                );
+            }
+
+            // 更新表情粒子位置，使其位于粒子核心内部
+            if (typeof faceSystem !== 'undefined') {
+                faceSystem.position.copy(particleState.position);
+                // 表情随粒子一起旋转
+                faceSystem.rotation.y = time * 0.1;
+            }
+
+            // 更新日冕光流位置和动画
+            if (typeof coronaSystem !== 'undefined') {
+                coronaSystem.position.copy(particleState.position);
+                // 日冕缓慢旋转
+                coronaSystem.rotation.y = time * 0.05;
+                // 日冕脉动效果
+                const scale = 1 + Math.sin(time * 2) * 0.1;
+                coronaSystem.scale.set(scale, scale, scale);
+            }
+
+            // 更新能量涟漪位置和动画
+            if (typeof rippleSystem !== 'undefined') {
+                // 计算手指与粒子接触的位置
+                const direction = particleState.velocity.clone().normalize().negate();
+                const contactPosition = particleState.position.clone().add(direction.multiplyScalar(30));
+                
+                rippleSystem.position.copy(contactPosition);
+                // 涟漪扩散动画
+                const scale = 1 + Math.sin(time * 5) * 0.5;
+                rippleSystem.scale.set(scale, scale, scale);
+                // 涟漪旋转
+                rippleSystem.rotation.y = time * 0.2;
+            }
+
+            // 更新轨迹
+            updateTrail();
+        }
+
+        function updateTrail() {
+            // 添加当前位置到轨迹
+            particleState.trail.push({ position: particleState.position.clone(), time: time });
+
+            // 限制轨迹长度
+            if (particleState.trail.length > 100) {
+                particleState.trail.shift();
+            }
+
+            // 更新轨迹粒子
+            if (trailSystem) {
+                const positions = trailSystem.geometry.attributes.position.array;
+                let index = 0;
+
+                // 遍历轨迹点，生成螺旋消散效果
+                for (let i = 0; i < CONFIG.trailParticleCount; i++) {
+                    if (particleState.trail.length > 0) {
+                        // 找到对应的轨迹点
+                        const trailIndex = Math.floor((i / CONFIG.trailParticleCount) * particleState.trail.length);
+                        const trailPoint = particleState.trail[trailIndex];
+                        
+                        // 计算偏移量，创建螺旋效果
+                        const age = time - trailPoint.time;
+                        const spiralRadius = age * 2;
+                        const spiralAngle = age * 5 + i * 0.1;
+                        
+                        // 螺旋轨迹
+                        const offsetX = Math.cos(spiralAngle) * spiralRadius;
+                        const offsetY = Math.sin(spiralAngle) * spiralRadius * 0.5;
+                        const offsetZ = Math.sin(spiralAngle) * spiralRadius * 0.3;
+
+                        positions[index++] = trailPoint.position.x - offsetX;
+                        positions[index++] = trailPoint.position.y + offsetY;
+                        positions[index++] = trailPoint.position.z + offsetZ;
+                    } else {
+                        positions[index++] = 0;
+                        positions[index++] = 0;
+                        positions[index++] = 0;
+                    }
+                }
+
+                trailSystem.geometry.attributes.position.needsUpdate = true;
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            time += 0.01;
+
+            // 更新粒子
+            updateParticle();
+
+            // 粒子本身的一些细微蠕动
+            if (particleSystem) {
+                particleSystem.rotation.y = time * 0.1;
+            }
+            if (nebulaSystem) {
+                nebulaSystem.rotation.y = time * 0.05;
+            }
+
+            updateCamera();
+
+            composer.render();
+        }
+
+        // ==========================================
+        // 4. MediaPipe Hands 集成
+        // ==========================================
+        
+        // 预览 Canvas
+        const previewCanvas = document.getElementById('webcam-preview');
+        const previewCtx = previewCanvas.getContext('2d');
+        
+        function onResults(results) {
+            // 绘制预览图（方便用户调试位置）
+            previewCtx.save();
+            previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+            previewCtx.drawImage(results.image, 0, 0, previewCanvas.width, previewCanvas.height);
+            
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 绘制骨架到小窗
+                drawConnectors(previewCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                drawLandmarks(previewCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+
+                // --- 逻辑判断 ---
+                
+                // 1. 判断旋转 (计算手掌倾斜度)
+                // 使用手腕(0)和中指指根(9)的X坐标差值来判断旋转
+                // 正常竖直时，x接近。向左歪或向右歪会产生 deltaX
+                const wrist = landmarks[0];
+                const middleBase = landmarks[9];
+                
+                // 计算 Roll 角 (围绕 Z 轴的旋转)
+                // Math.atan2(y, x). 这里我们看 dx 和 dy
+                // 注意：Webcam 坐标系 y 向下为正
+                const dx = middleBase.x - wrist.x;
+                const dy = middleBase.y - wrist.y; 
+                // 理想竖直状态 dy 很大(负值)，dx 很小
+                // 简单起见，我们直接映射 dx。
+                // 如果手向右歪(顺时针)，dx > 0。向左歪，dx < 0。
+                // 乘以一个灵敏度系数
+                cameraState.handRotation = dx * -5.0; // 反向使得符合直觉
+
+
+                // 2. 判断 握拳 vs 张开
+                // 算法：计算指尖(Tip)到手腕(Wrist)的距离，对比指根(MCP)到手腕的距离
+                // 如果 Tip 距离 < MCP 距离，说明折叠了。
+                
+                const fingerTips = [8, 12, 16, 20]; // 食指到小指尖
+                const fingerMCPs = [5, 9, 13, 17];  // 食指到小指根
+                
+                let foldedCount = 0;
+                
+                // 简单距离平方比较
+                const distSq = (p1, p2) => (p1.x - p2.x)**2 + (p1.y - p2.y)**2;
+
+                for (let i = 0; i < 4; i++) {
+                    const dTip = distSq(landmarks[fingerTips[i]], wrist);
+                    const dMcp = distSq(landmarks[fingerMCPs[i]], wrist);
+                    // 如果指尖比指根离手腕更近，或者非常接近，判定为弯曲
+                    // 加上一个阈值系数
+                    if (dTip < dMcp * 1.2) {
+                        foldedCount++;
+                    }
+                }
+
+                // 状态机
+                if (foldedCount >= 3) {
+                    cameraState.isFist = true;
+                    cameraState.isOpen = false;
+                    statusEl.innerText = "状态: ✊ 握拳 (拉远)";
+                    statusEl.style.color = "#ff4444";
+                } else if (foldedCount === 0) {
+                    cameraState.isFist = false;
+                    cameraState.isOpen = true;
+                    statusEl.innerText = "状态: ✋ 张开 (靠近)";
+                    statusEl.style.color = "#44ff44";
+                } else {
+                    cameraState.isFist = false;
+                    cameraState.isOpen = false;
+                    statusEl.innerText = "状态: 🤞 旋转控制中";
+                    statusEl.style.color = "#00ffcc";
+                }
+
+            } else {
+                // 没有检测到手
+                cameraState.handRotation = 0;
+                cameraState.isFist = false;
+                cameraState.isOpen = false;
+                statusEl.innerText = "未检测到手";
+                statusEl.style.color = "#888";
+            }
+            previewCtx.restore();
+        }
+
+        function initMediaPipe() {
+            const videoElement = document.getElementById('input-video');
+
+            // 这里的 Hands 来自全局变量 (Script Tag引入)
+            const hands = new window.Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onResults);
+
+            // 使用 Camera Utils 启动摄像头
+            const cameraUtils = new window.Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+            
+            cameraUtils.start()
+                .then(() => {
+                    loadingEl.style.display = 'none';
+                })
+                .catch(err => {
+                    loadingEl.innerHTML = "摄像头启动失败: " + err;
+                });
+            
+            // 设置预览画布大小
+            previewCanvas.width = 160;
+            previewCanvas.height = 120;
+        }
+
+        // ==========================================
+        // 启动
+        // ==========================================
+        initThree();
+        animate();
+        // 延迟一点加载AI，让UI先出来
+        setTimeout(initMediaPipe, 1000);
+
+        // 处理音频播放（需要用户交互）
+        function enableAudio() {
+            const audio = document.getElementById('background-music');
+            if (audio) {
+                // 确保音频已加载
+                if (audio.readyState >= 2) {
+                    audio.volume = 0.3; // 设置音量为30%
+                    audio.play().catch(err => {
+                        console.log('音频播放失败:', err);
+                    });
+                } else {
+                    // 等待音频加载完成
+                    audio.addEventListener('canplaythrough', function() {
+                        audio.volume = 0.3;
+                        audio.play().catch(err => {
+                            console.log('音频播放失败:', err);
+                        });
+                    });
+                }
+            }
+            // 移除事件监听器，避免重复触发
+            document.removeEventListener('click', enableAudio);
+            document.removeEventListener('touchstart', enableAudio);
+        }
+
+        // 添加用户交互事件监听器
+        document.addEventListener('click', enableAudio);
+        document.addEventListener('touchstart', enableAudio);
+        // 也添加键盘事件，确保用户通过键盘交互也能触发
+        document.addEventListener('keydown', enableAudio);
+
+    </script>
+</body>
+</html>
